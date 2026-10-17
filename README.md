@@ -22,7 +22,6 @@ PDF_REFINE_KEY=<secret> python app.py
 | `PDF_REFINE_PORT` | `8790` | 수신 포트 |
 | `PDF_REFINE_WORKERS` | `2` | 동시에 처리하는 PDF 수. PDF마다 별도 프로세스를 씁니다 |
 
-
 ## API
 
 ### `POST /refine`
@@ -55,4 +54,4 @@ PDF_REFINE_KEY=<secret> python app.py
 
 ## 라이선스
 
-[GNU AGPL-3.0](LICENSE). 이 서비스가 사용하는 PyMuPDF, PyMuPDF4LLM, PyMuPDF Layout(Artifex)이 AGPL-3.0으로 배포
+이 프로젝트는 [GNU AGPL-3.0](LICENSE)을 따릅니다. 의존하는 PyMuPDF, PyMuPDF4LLM, PyMuPDF Layout(Artifex)이 AGPL-3.0으로 배포되기 때문입니다.
