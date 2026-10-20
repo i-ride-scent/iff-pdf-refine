@@ -58,6 +58,11 @@ FIGURE_MARGIN = 12
 FIGURE_MAX_SIDE = 1024
 FIGURE_MAX_DPI = 200
 FIGURE_QUALITY = 75
+# A picture filling this share of its page (a slide that is one screenshot) is taken for a
+# background by the layout model and left out; it's kept when its page has fewer letters
+# of its own than this, and it's on no other page (a slide template's backdrop is).
+FULL_PAGE_SHARE = 0.5
+MAX_FULL_PAGE_TEXT = 200
 # The largest ones are kept, page by page and in all.
 MAX_PAGE_FIGURES = 2
 MAX_FIGURES = 40
@@ -83,21 +88,32 @@ def figures(doc, chunks: list[dict]) -> list[dict]:
     """The pictures of each page (its "picture" layout boxes) as JPEG data: URLs, in page order.
 
     A picture the same on several pages (a slide template's logo or background) is left out.
+    A page that is mostly one picture and little text gets that picture too (FULL_PAGE_SHARE).
     """
     import base64
     import hashlib
 
     import pymupdf
 
+    images = [page.get_image_info(hashes=True) for page in doc]
+    pages_with = {}
+    for index, infos in enumerate(images):
+        for info in infos:
+            pages_with.setdefault(info.get("digest"), set()).add(index)
+
     found = []
     for index, chunk in enumerate(chunks):
         page = doc[index]
         area = page.rect.width * page.rect.height
+        rects = [pymupdf.Rect(box["bbox"]) for box in chunk.get("page_boxes") or [] if box.get("class") == "picture"]
+        if not rects and len(re.sub(r"\s", "", clean(chunk["text"]))) < MAX_FULL_PAGE_TEXT:
+            for info in images[index]:
+                rect = pymupdf.Rect(info["bbox"]) & page.rect
+                if area and rect.width * rect.height >= area * FULL_PAGE_SHARE and len(pages_with[info.get("digest")]) == 1:
+                    rects.append(rect)
         boxes = []
-        for box in chunk.get("page_boxes") or []:
-            if box.get("class") != "picture":
-                continue
-            rect = pymupdf.Rect(box["bbox"]) & page.rect
+        for rect in rects:
+            rect = rect & page.rect
             if rect.is_empty or min(rect.width, rect.height) < MIN_FIGURE_SIDE:
                 continue
             if area and rect.width * rect.height < area * MIN_FIGURE_SHARE:
