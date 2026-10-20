@@ -6,13 +6,17 @@
 # Software Foundation, version 3. It is distributed WITHOUT ANY WARRANTY; see the
 # LICENSE file. It uses PyMuPDF and PyMuPDF4LLM (Artifex), under the same license.
 
-"""A PDF's pages as Markdown, over HTTP.
+"""A PDF's pages as Markdown, and its figures as images, over HTTP.
 
 Each page is read in layout order by PyMuPDF4LLM's layout model, with its
 headings, bullets joined to their text and running headers and footers left out.
+The pictures the layout model finds (diagrams, charts, photos) are cut out of
+their pages as JPEGs, for a model that sees images to look at.
 
     POST /refine    the PDF's bytes (Authorization: Bearer <PDF_REFINE_KEY>)
-                    -> {"pages": [<a page's Markdown>, ...], "seconds": <float>}
+                    -> {"pages": [<a page's Markdown>, ...],
+                        "figures": [{"page": <0-based index>, "image": <JPEG data: URL>}, ...],
+                        "seconds": <float>}
     GET  /health    -> {"ok": true}
 
 Environment: PDF_REFINE_KEY (required), PDF_REFINE_PORT (8790),
@@ -44,6 +48,20 @@ TAG = re.compile(r"</?[a-zA-Z][^>]*>")
 # "**BLOOD FL** **OW IN**": one bold run split in two.
 SPLIT_BOLD = re.compile(r"\*\*[ \t]+\*\*")
 
+# A picture smaller than this share of its page, or this many points on a side,
+# is an icon, a logo or a bullet, not a figure to explain.
+MIN_FIGURE_SHARE = 0.03
+MIN_FIGURE_SIDE = 48
+# Room kept around a picture, in points, for its labels and axis titles set as text beside it.
+FIGURE_MARGIN = 12
+# A figure's longest side, in pixels, and its JPEG quality: enough to read its labels.
+FIGURE_MAX_SIDE = 1024
+FIGURE_MAX_DPI = 200
+FIGURE_QUALITY = 75
+# The largest ones are kept, page by page and in all.
+MAX_PAGE_FIGURES = 2
+MAX_FIGURES = 40
+
 
 def clean(markdown: str) -> str:
     """A page's Markdown as it's returned: no HTML, a line per line, no blank lines."""
@@ -61,7 +79,53 @@ def _load():
     import pymupdf4llm  # noqa: F401
 
 
-def refine(data: bytes) -> list[str]:
+def figures(doc, chunks: list[dict]) -> list[dict]:
+    """The pictures of each page (its "picture" layout boxes) as JPEG data: URLs, in page order.
+
+    A picture the same on several pages (a slide template's logo or background) is left out.
+    """
+    import base64
+    import hashlib
+
+    import pymupdf
+
+    found = []
+    for index, chunk in enumerate(chunks):
+        page = doc[index]
+        area = page.rect.width * page.rect.height
+        boxes = []
+        for box in chunk.get("page_boxes") or []:
+            if box.get("class") != "picture":
+                continue
+            rect = pymupdf.Rect(box["bbox"]) & page.rect
+            if rect.is_empty or min(rect.width, rect.height) < MIN_FIGURE_SIDE:
+                continue
+            if area and rect.width * rect.height < area * MIN_FIGURE_SHARE:
+                continue
+            boxes.append((rect + (-FIGURE_MARGIN, -FIGURE_MARGIN, FIGURE_MARGIN, FIGURE_MARGIN)) & page.rect)
+        boxes.sort(key=lambda rect: rect.width * rect.height, reverse=True)
+        for rect in boxes[:MAX_PAGE_FIGURES]:
+            dpi = min(FIGURE_MAX_DPI, FIGURE_MAX_SIDE * 72 / max(rect.width, rect.height))
+            pix = page.get_pixmap(clip=rect, dpi=max(36, int(dpi)), alpha=False)
+            if pix.width < 1 or pix.height < 1:
+                continue
+            jpeg = pix.tobytes("jpg", jpg_quality=FIGURE_QUALITY)
+            found.append({"page": index, "area": rect.width * rect.height, "jpeg": jpeg, "hash": hashlib.sha1(pix.samples).digest()})
+
+    pages_of = {}
+    for figure in found:
+        pages_of.setdefault(figure["hash"], set()).add(figure["page"])
+    kept = [figure for figure in found if len(pages_of[figure["hash"]]) == 1]
+    if len(kept) > MAX_FIGURES:
+        largest = sorted(kept, key=lambda figure: figure["area"], reverse=True)[:MAX_FIGURES]
+        kept = [figure for figure in kept if figure in largest]
+    return [
+        {"page": figure["page"], "image": "data:image/jpeg;base64," + base64.b64encode(figure["jpeg"]).decode("ascii")}
+        for figure in kept
+    ]
+
+
+def refine(data: bytes) -> tuple[list[str], list[dict]]:
     import pymupdf
     import pymupdf4llm
 
@@ -73,7 +137,13 @@ def refine(data: bytes) -> list[str]:
         )
         if len(chunks) != doc.page_count:
             raise ValueError(f"{len(chunks)} pages read of {doc.page_count}")
-    return [clean(chunk["text"]) for chunk in chunks]
+        # The text is what matters most: a figure that can't be cut out leaves them all out.
+        try:
+            found = figures(doc, chunks)
+        except Exception as e:
+            print(f"figures not cut out: {e}", flush=True)
+            found = []
+    return [clean(chunk["text"]) for chunk in chunks], found
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -112,7 +182,7 @@ class Handler(BaseHTTPRequestHandler):
 
         started = time.perf_counter()
         try:
-            pages = self.pool.submit(refine, data).result(timeout=TIMEOUT_S)
+            pages, found = self.pool.submit(refine, data).result(timeout=TIMEOUT_S)
         except FutureTimeout:
             self.send_json(504, {"error": "timed out"})
             return
@@ -121,8 +191,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(422, {"error": str(e)[:300]})
             return
         seconds = round(time.perf_counter() - started, 2)
-        self.log_message("refined %d pages (%d bytes) in %.2fs", len(pages), length, seconds)
-        self.send_json(200, {"pages": pages, "seconds": seconds})
+        self.log_message("refined %d pages (%d bytes), %d figures, in %.2fs", len(pages), length, len(found), seconds)
+        self.send_json(200, {"pages": pages, "figures": found, "seconds": seconds})
 
 
 def main() -> None:

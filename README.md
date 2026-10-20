@@ -1,6 +1,6 @@
 # iff-pdf-refine
 
-PDF를 페이지별 Markdown으로 변환하는 HTTP 서비스입니다. [PyMuPDF4LLM](https://github.com/pymupdf/pymupdf4llm)의 레이아웃 분석으로 읽는 순서를 복원하고, 제목과 목록 구조를 유지하며, 반복되는 머리글과 바닥글을 제외합니다.
+PDF를 페이지별 Markdown으로 변환하는 HTTP 서비스입니다. [PyMuPDF4LLM](https://github.com/pymupdf/pymupdf4llm)의 레이아웃 분석으로 읽는 순서를 복원하고, 제목과 목록 구조를 유지하며, 반복되는 머리글과 바닥글을 제외합니다. 레이아웃 분석이 찾은 그림(도표, 차트, 사진)은 JPEG 이미지로 잘라 함께 반환합니다.
 
 ## 요구 사항
 
@@ -29,7 +29,11 @@ PDF_REFINE_KEY=<secret> python app.py
 요청 본문은 PDF 바이너리이고, `Authorization: Bearer <PDF_REFINE_KEY>` 헤더가 필요합니다.
 
 ```json
-{ "pages": ["# 제목\n- 항목", "..."], "seconds": 3.47 }
+{
+  "pages": ["# 제목\n- 항목", "..."],
+  "figures": [{ "page": 0, "image": "data:image/jpeg;base64,..." }],
+  "seconds": 3.47
+}
 ```
 
 | 상태 코드 | 의미 |
@@ -50,6 +54,9 @@ PDF_REFINE_KEY=<secret> python app.py
 - 입력 PDF의 쪽마다 문자열 하나를 반환하며, 배열 길이는 쪽 수와 같습니다.
 - HTML 태그와 빈 줄을 제거하고, 위첨자는 `^`, 아래첨자는 `_`로 표기합니다.
 - OCR은 수행하지 않습니다. 텍스트 레이어가 없는 쪽은 빈 문자열이 됩니다.
+- `figures`는 쪽 순서대로이며, `page`는 0부터 센 쪽 번호입니다. 각 그림은 둘레 12pt를 포함해 잘라내고, 긴 변 1024px 이하의 JPEG(품질 75)로 만듭니다.
+- 쪽 면적의 3%보다 작거나 한 변이 48pt보다 짧은 그림(아이콘, 로고)과, 여러 쪽에 똑같이 나오는 그림(템플릿 장식)은 제외합니다. 쪽마다 큰 것 2개, 문서 전체에서 40개까지 반환합니다.
+- 그림을 잘라내다 오류가 나면 `figures`는 빈 배열이 되고, 텍스트는 그대로 반환합니다.
 - 첫 요청은 레이아웃 모델을 불러오느라 몇 초 더 걸립니다.
 
 ## 라이선스
