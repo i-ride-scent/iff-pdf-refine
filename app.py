@@ -11,11 +11,14 @@
 Each page is read in layout order by PyMuPDF4LLM's layout model, with its
 headings, bullets joined to their text and running headers and footers left out.
 The pictures the layout model finds (diagrams, charts, photos) are cut out of
-their pages as JPEGs, for a model that sees images to look at.
+their pages as JPEGs, for a model that sees images to look at. A page with more
+in pictures than a few cut-out figures carry (formulas, worked answers and
+slides pasted in as images) is given whole instead, as one image of the page.
 
     POST /refine    the PDF's bytes (Authorization: Bearer <PDF_REFINE_KEY>)
                     -> {"pages": [<a page's Markdown>, ...],
-                        "figures": [{"page": <0-based index>, "image": <JPEG data: URL>}, ...],
+                        "figures": [{"page": <0-based index>, "image": <JPEG data: URL>,
+                                     "whole": <true for the whole page, else absent>}, ...],
                         "seconds": <float>}
     GET  /health    -> {"ok": true}
 
@@ -66,6 +69,16 @@ MAX_FULL_PAGE_TEXT = 200
 # The largest ones are kept, page by page and in all.
 MAX_PAGE_FIGURES = 2
 MAX_FIGURES = 40
+# A page whose pictures left out (past MAX_PAGE_FIGURES, or too small to be figures, such as a
+# formula or a worked answer pasted in as an image) cover this share of it is given whole, as
+# one image: their content is in no figure and, being pictures, not in the page's text either.
+# Only the layout model's pictures count, so not decorations it passes over, nor a
+# background (a picture filling FULL_PAGE_SHARE of the page). Its longest side, in pixels: small print in formulas read right
+# at 1536 and not at 1024.
+WHOLE_PAGE_LEFT_OUT = 0.15
+WHOLE_PAGE_MAX_SIDE = 1536
+# The grid, in points, on which the pictures' area is measured.
+AREA_GRID = 4
 
 
 def clean(markdown: str) -> str:
@@ -84,11 +97,22 @@ def _load():
     import pymupdf4llm  # noqa: F401
 
 
+def covered(rects) -> set:
+    """The AREA_GRID cells the rectangles cover, so overlapping ones count once."""
+    cells = set()
+    for rect in rects:
+        for x in range(int(rect.x0 // AREA_GRID), int(rect.x1 // AREA_GRID)):
+            for y in range(int(rect.y0 // AREA_GRID), int(rect.y1 // AREA_GRID)):
+                cells.add((x, y))
+    return cells
+
+
 def figures(doc, chunks: list[dict]) -> list[dict]:
     """The pictures of each page (its "picture" layout boxes) as JPEG data: URLs, in page order.
 
     A picture the same on several pages (a slide template's logo or background) is left out.
     A page that is mostly one picture and little text gets that picture too (FULL_PAGE_SHARE).
+    A page whose pictures left out would cover WHOLE_PAGE_LEFT_OUT of it is one image instead.
     """
     import base64
     import hashlib
@@ -120,6 +144,16 @@ def figures(doc, chunks: list[dict]) -> list[dict]:
                 continue
             boxes.append((rect + (-FIGURE_MARGIN, -FIGURE_MARGIN, FIGURE_MARGIN, FIGURE_MARGIN)) & page.rect)
         boxes.sort(key=lambda rect: rect.width * rect.height, reverse=True)
+        if area:
+            content = [rect & page.rect for rect in rects]
+            content = [rect for rect in content if not rect.is_empty and rect.width * rect.height < area * FULL_PAGE_SHARE]
+            left_out = covered(content) - covered(boxes[:MAX_PAGE_FIGURES])
+            if len(left_out) * AREA_GRID * AREA_GRID >= area * WHOLE_PAGE_LEFT_OUT:
+                dpi = min(FIGURE_MAX_DPI, WHOLE_PAGE_MAX_SIDE * 72 / max(page.rect.width, page.rect.height))
+                pix = page.get_pixmap(dpi=max(36, int(dpi)), alpha=False)
+                jpeg = pix.tobytes("jpg", jpg_quality=FIGURE_QUALITY)
+                found.append({"page": index, "area": area, "jpeg": jpeg, "hash": hashlib.sha1(pix.samples).digest(), "whole": True})
+                continue
         for rect in boxes[:MAX_PAGE_FIGURES]:
             dpi = min(FIGURE_MAX_DPI, FIGURE_MAX_SIDE * 72 / max(rect.width, rect.height))
             pix = page.get_pixmap(clip=rect, dpi=max(36, int(dpi)), alpha=False)
@@ -137,6 +171,7 @@ def figures(doc, chunks: list[dict]) -> list[dict]:
         kept = [figure for figure in kept if figure in largest]
     return [
         {"page": figure["page"], "image": "data:image/jpeg;base64," + base64.b64encode(figure["jpeg"]).decode("ascii")}
+        | ({"whole": True} if figure.get("whole") else {})
         for figure in kept
     ]
 
