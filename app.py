@@ -14,11 +14,15 @@ The pictures the layout model finds (diagrams, charts, photos) are cut out of
 their pages as JPEGs, for a model that sees images to look at. A page with more
 in pictures than a few cut-out figures carry (formulas, worked answers and
 slides pasted in as images) is given whole instead, as one image of the page.
+A table that is really a drawing (boxes and arrows), whose Markdown splits its
+lines across columns, is cut out too, and its Markdown is replaced by its lines
+of text as they're laid out.
 
     POST /refine    the PDF's bytes (Authorization: Bearer <PDF_REFINE_KEY>)
                     -> {"pages": [<a page's Markdown>, ...],
                         "figures": [{"page": <0-based index>, "image": <JPEG data: URL>,
-                                     "whole": <true for the whole page, else absent>}, ...],
+                                     "whole": <true for the whole page, else absent>,
+                                     "table": <true when it's (or has) a drawn table, else absent>}, ...],
                         "seconds": <float>}
     GET  /health    -> {"ok": true}
 
@@ -30,9 +34,12 @@ import hmac
 import json
 import os
 import re
+import signal
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures.process import BrokenProcessPool
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 KEY = os.environ.get("PDF_REFINE_KEY", "")
@@ -79,6 +86,24 @@ WHOLE_PAGE_LEFT_OUT = 0.15
 WHOLE_PAGE_MAX_SIDE = 1536
 # The grid, in points, on which the pictures' area is measured.
 AREA_GRID = 4
+# A table that is really a drawing (boxes joined by arrows, a note under them spanning their
+# columns) comes out of the layout model as a table whose cells split its lines, a word cut
+# across two columns: it's cut out too, as a figure marked "table". It's told by lines drawn
+# askew in it (arrowheads, connectors; a ruled table has none) or by U+FFFD in its rows (glyphs
+# the table reader couldn't map, as in a press release whose flow chart lost a footnote this way).
+TABLE_ASKEW_LINES = 2
+MISREAD = "�"
+# Such a table's Markdown is replaced by its lines of text as they're laid out, top to bottom
+# and left to right ("(전공시험*)" then "* 컴퓨터공학, 정보보호학 중 택1" under it), not cut into
+# cells, so a "*" note comes right after the item it's for. Lines starting within this many
+# points below a row's first one are on that row.
+TABLE_ROW_GAP = 8
+# A run of a Markdown table's lines.
+TABLE_BLOCK = re.compile(r"(?:^[ \t]*\|[^\n]*(?:\n|$))+", re.M)
+# The lines are read from the PDF opened again, as a task of its own: reading them right after the
+# layout model killed the container's worker on that press release (not on Windows). If this
+# task dies or takes longer than this, the tables keep their cells.
+LAY_OUT_TIMEOUT_S = 60
 
 
 def clean(markdown: str) -> str:
@@ -107,12 +132,85 @@ def covered(rects) -> set:
     return cells
 
 
+def drawn_tables(page, chunk: dict) -> list:
+    """The page's "table" layout boxes that are drawings rather than ruled tables (TABLE_ASKEW_LINES)."""
+    import pymupdf
+
+    tables = [pymupdf.Rect(box["bbox"]) for box in chunk.get("page_boxes") or [] if box.get("class") == "table"]
+    if not tables:
+        return []
+    if any(MISREAD in line for line in chunk["text"].splitlines() if line.lstrip().startswith("|")):
+        return tables
+    drawings = page.get_drawings()
+    drawn = []
+    for table in tables:
+        askew = sum(
+            1
+            for drawing in drawings
+            if pymupdf.Rect(drawing["rect"]).intersects(table)
+            for item in drawing["items"]
+            if item[0] == "l" and abs(item[1].x - item[2].x) > 1 and abs(item[1].y - item[2].y) > 1
+        )
+        if askew >= TABLE_ASKEW_LINES:
+            drawn.append(table)
+    return drawn
+
+
+def to_lay_out(page, chunk: dict, text: str) -> list[tuple[int, tuple]]:
+    """The drawn tables of a page (drawn_tables) as (their Markdown block in `text`, their box), when its blocks are its tables'."""
+    drawn = drawn_tables(page, chunk)
+    if not drawn:
+        return []
+    tables = [tuple(box["bbox"]) for box in chunk.get("page_boxes") or [] if box.get("class") == "table"]
+    # The Markdown's tables are taken to be the layout boxes', in order: not when there are more or fewer.
+    if len(TABLE_BLOCK.findall(text)) != len(tables):
+        return []
+    drawn = [tuple(rect) for rect in drawn]
+    return [(index, table) for index, table in enumerate(tables) if table in drawn]
+
+
+def lay_out(data: bytes, wanted: dict) -> dict:
+    """The laid-out lines of the tables in `wanted` ({page: [(block, box)]}), read from the PDF opened afresh."""
+    import pymupdf
+
+    found = {}
+    with pymupdf.open(stream=data, filetype="pdf") as doc:
+        for index, tables in wanted.items():
+            page = doc[index]
+            found[index] = {}
+            for block, box in tables:
+                rows = []
+                lines = []
+                for item in page.get_text("dict", clip=pymupdf.Rect(box))["blocks"]:
+                    for line in item.get("lines", []):
+                        text = "".join(span["text"] for span in line["spans"]).strip()
+                        if text:
+                            lines.append((line["bbox"][1], line["bbox"][0], text))
+                for top, left, text in sorted(lines):
+                    if not rows or top - rows[-1][0] > TABLE_ROW_GAP:
+                        rows.append((top, []))
+                    rows[-1][1].append((left, text))
+                if rows:
+                    found[index][block] = "\n".join(" ".join(text for _, text in sorted(row)) for _, row in rows)
+    return found
+
+
+def put_lines(text: str, lines: dict) -> str:
+    """`text` with its Markdown tables numbered in `lines` ({block: laid-out lines}) replaced by them."""
+    blocks = list(TABLE_BLOCK.finditer(text))
+    for block, match in reversed(list(enumerate(blocks))):
+        if block in lines:
+            text = text[: match.start()] + lines[block] + "\n" + text[match.end() :]
+    return text.strip()
+
+
 def figures(doc, chunks: list[dict]) -> list[dict]:
     """The pictures of each page (its "picture" layout boxes) as JPEG data: URLs, in page order.
 
     A picture the same on several pages (a slide template's logo or background) is left out.
     A page that is mostly one picture and little text gets that picture too (FULL_PAGE_SHARE).
     A page whose pictures left out would cover WHOLE_PAGE_LEFT_OUT of it is one image instead.
+    A table that is a drawing (drawn_tables) is a figure too, marked "table".
     """
     import base64
     import hashlib
@@ -135,32 +233,33 @@ def figures(doc, chunks: list[dict]) -> list[dict]:
                 rect = pymupdf.Rect(info["bbox"]) & page.rect
                 if area and rect.width * rect.height >= area * FULL_PAGE_SHARE and len(pages_with[info.get("digest")]) == 1:
                     rects.append(rect)
+        tables = drawn_tables(page, chunk)
         boxes = []
-        for rect in rects:
+        for rect, table in [(rect, False) for rect in rects] + [(rect, True) for rect in tables]:
             rect = rect & page.rect
             if rect.is_empty or min(rect.width, rect.height) < MIN_FIGURE_SIDE:
                 continue
             if area and rect.width * rect.height < area * MIN_FIGURE_SHARE:
                 continue
-            boxes.append((rect + (-FIGURE_MARGIN, -FIGURE_MARGIN, FIGURE_MARGIN, FIGURE_MARGIN)) & page.rect)
-        boxes.sort(key=lambda rect: rect.width * rect.height, reverse=True)
+            boxes.append(((rect + (-FIGURE_MARGIN, -FIGURE_MARGIN, FIGURE_MARGIN, FIGURE_MARGIN)) & page.rect, table))
+        boxes.sort(key=lambda box: box[0].width * box[0].height, reverse=True)
         if area:
             content = [rect & page.rect for rect in rects]
             content = [rect for rect in content if not rect.is_empty and rect.width * rect.height < area * FULL_PAGE_SHARE]
-            left_out = covered(content) - covered(boxes[:MAX_PAGE_FIGURES])
+            left_out = covered(content) - covered([rect for rect, _ in boxes[:MAX_PAGE_FIGURES]])
             if len(left_out) * AREA_GRID * AREA_GRID >= area * WHOLE_PAGE_LEFT_OUT:
                 dpi = min(FIGURE_MAX_DPI, WHOLE_PAGE_MAX_SIDE * 72 / max(page.rect.width, page.rect.height))
                 pix = page.get_pixmap(dpi=max(36, int(dpi)), alpha=False)
                 jpeg = pix.tobytes("jpg", jpg_quality=FIGURE_QUALITY)
-                found.append({"page": index, "area": area, "jpeg": jpeg, "hash": hashlib.sha1(pix.samples).digest(), "whole": True})
+                found.append({"page": index, "area": area, "jpeg": jpeg, "hash": hashlib.sha1(pix.samples).digest(), "whole": True, "table": bool(tables)})
                 continue
-        for rect in boxes[:MAX_PAGE_FIGURES]:
+        for rect, table in boxes[:MAX_PAGE_FIGURES]:
             dpi = min(FIGURE_MAX_DPI, FIGURE_MAX_SIDE * 72 / max(rect.width, rect.height))
             pix = page.get_pixmap(clip=rect, dpi=max(36, int(dpi)), alpha=False)
             if pix.width < 1 or pix.height < 1:
                 continue
             jpeg = pix.tobytes("jpg", jpg_quality=FIGURE_QUALITY)
-            found.append({"page": index, "area": rect.width * rect.height, "jpeg": jpeg, "hash": hashlib.sha1(pix.samples).digest()})
+            found.append({"page": index, "area": rect.width * rect.height, "jpeg": jpeg, "hash": hashlib.sha1(pix.samples).digest(), "table": table})
 
     pages_of = {}
     for figure in found:
@@ -172,11 +271,13 @@ def figures(doc, chunks: list[dict]) -> list[dict]:
     return [
         {"page": figure["page"], "image": "data:image/jpeg;base64," + base64.b64encode(figure["jpeg"]).decode("ascii")}
         | ({"whole": True} if figure.get("whole") else {})
+        | ({"table": True} if figure.get("table") else {})
         for figure in kept
     ]
 
 
-def refine(data: bytes) -> tuple[list[str], list[dict]]:
+def refine(data: bytes) -> tuple[list[str], list[dict], dict]:
+    """The pages' Markdown, the figures, and the drawn tables to lay out (to_lay_out), by page."""
     import pymupdf
     import pymupdf4llm
 
@@ -194,11 +295,32 @@ def refine(data: bytes) -> tuple[list[str], list[dict]]:
         except Exception as e:
             print(f"figures not cut out: {e}", flush=True)
             found = []
-    return [clean(chunk["text"]) for chunk in chunks], found
+        texts = [clean(chunk["text"]) for chunk in chunks]
+        wanted = {}
+        for index, chunk in enumerate(chunks):
+            try:
+                tables = to_lay_out(doc[index], chunk, texts[index])
+            except Exception as e:
+                print(f"page {index + 1}'s drawn tables not found: {e}", flush=True)
+                tables = []
+            if tables:
+                wanted[index] = tables
+    return texts, found, wanted
 
 
 class Handler(BaseHTTPRequestHandler):
     pool: ProcessPoolExecutor
+    restarting = threading.Lock()
+
+    @classmethod
+    def restart(cls) -> None:
+        """A new pool for a broken one, once when several requests find it broken."""
+        with cls.restarting:
+            old = cls.pool
+            if not getattr(old, "_broken", False):
+                return
+            cls.pool = start_pool()
+            old.shutdown(wait=False, cancel_futures=True)
 
     def send_json(self, status: int, value: dict) -> None:
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -207,6 +329,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def laid_out(self, data: bytes, wanted: dict, pages: list[str]) -> list[str]:
+        """The pages with their drawn tables as laid-out lines (lay_out); as they were if that fails."""
+        try:
+            lines = self.pool.submit(lay_out, data, wanted).result(timeout=LAY_OUT_TIMEOUT_S)
+        except BrokenProcessPool as e:
+            self.log_message("drawn tables left in cells, the workers are started again: %s", e)
+            Handler.restart()
+            return pages
+        except Exception as e:
+            self.log_message("drawn tables left in cells: %s", e or type(e).__name__)
+            return pages
+        self.log_message("laid out %d drawn tables", sum(len(found) for found in lines.values()))
+        return [put_lines(page, lines[index]) if lines.get(index) else page for index, page in enumerate(pages)]
 
     def do_GET(self) -> None:
         if self.path == "/health":
@@ -233,25 +369,42 @@ class Handler(BaseHTTPRequestHandler):
 
         started = time.perf_counter()
         try:
-            pages, found = self.pool.submit(refine, data).result(timeout=TIMEOUT_S)
+            pages, found, wanted = self.pool.submit(refine, data).result(timeout=TIMEOUT_S)
         except FutureTimeout:
             self.send_json(504, {"error": "timed out"})
+            return
+        except BrokenProcessPool as e:
+            # A worker died reading it (killed, or crashed in PyMuPDF): the pool is made again,
+            # or every PDF after it would fail the same way until the service restarts.
+            self.log_message("refine failed, the workers are started again: %s", e)
+            Handler.restart()
+            self.send_json(422, {"error": str(e)[:300]})
             return
         except Exception as e:  # a PDF that can't be read
             self.log_message("refine failed: %s", e)
             self.send_json(422, {"error": str(e)[:300]})
             return
+        if wanted:
+            pages = self.laid_out(data, wanted, pages)
         seconds = round(time.perf_counter() - started, 2)
         self.log_message("refined %d pages (%d bytes), %d figures, in %.2fs", len(pages), length, len(found), seconds)
         self.send_json(200, {"pages": pages, "figures": found, "seconds": seconds})
 
 
+def start_pool() -> ProcessPoolExecutor:
+    # A process per PDF: PyMuPDF can't read several documents at once in one process.
+    # A worker is replaced every 50 PDFs, so what it holds on to doesn't build up.
+    return ProcessPoolExecutor(max_workers=WORKERS, initializer=_load, max_tasks_per_child=50)
+
+
 def main() -> None:
     if not KEY:
         raise SystemExit("PDF_REFINE_KEY is not set")
-    # A process per PDF: PyMuPDF can't read several documents at once in one process.
-    # A worker is replaced every 50 PDFs, so what it holds on to doesn't build up.
-    Handler.pool = ProcessPoolExecutor(max_workers=WORKERS, initializer=_load, max_tasks_per_child=50)
+    # As the container's first process (PID 1) it would ignore SIGTERM without a handler,
+    # so the container never slept once idle and was paid for all day. It's only sent
+    # when idle, so it exits at once (the workers go with the container).
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    Handler.pool = start_pool()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"pdf-refine listening on :{PORT} with {WORKERS} workers", flush=True)
     server.serve_forever()
