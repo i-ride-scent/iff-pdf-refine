@@ -309,6 +309,10 @@ def refine(data: bytes) -> tuple[list[str], list[dict], dict]:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Seconds a read or write on the socket may wait. Without it, a request whose body
+    # stopped coming (the upload cut off) waited forever, and the container, counting it
+    # as still being answered, never slept.
+    timeout = 60
     pool: ProcessPoolExecutor
     restarting = threading.Lock()
 
